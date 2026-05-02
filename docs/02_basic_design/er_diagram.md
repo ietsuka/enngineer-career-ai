@@ -3,8 +3,9 @@
 | 項目 | 内容 |
 |---|---|
 | プロジェクト名 | engineer-career-ai |
-| バージョン | 1.0 |
+| バージョン | 1.1 |
 | 作成日 | 2026-05-02 |
+| 更新日 | 2026-05-02 |
 
 ※ 物理設計(型・インデックス・DDL)は `03_detailed_design/db_physical_design.md` で定義する。
 
@@ -14,6 +15,7 @@
 
 ```mermaid
 erDiagram
+    USERS ||--|| USER_ROLES : "1:1 ロール管理"
     USERS ||--o| USER_PROFILES : "1:1 プロフィール"
     USERS ||--o{ CHAT_SESSIONS : "1:N 会話セッション"
     USERS ||--o{ CAREER_PLANS : "1:N キャリアプラン"
@@ -29,9 +31,16 @@ erDiagram
         uuid id PK
         string email UK
         string provider
-        string role
         timestamp deleted_at
         timestamp scheduled_purge_at
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    USER_ROLES {
+        uuid id PK
+        uuid user_id FK UK
+        string role
         timestamp created_at
         timestamp updated_at
     }
@@ -161,6 +170,7 @@ erDiagram
 | エンティティ名(論理) | テーブル名(物理) | 概要 |
 |---|---|---|
 | ユーザー | users | 認証ユーザー。Supabase Auth と連動 |
+| ユーザーロール | user_roles | ロール管理(free/admin)。JWT ではなく DB で管理 |
 | ユーザープロフィール | user_profiles | キャリア属性(ハンドルネーム/年齢/経歴/年収/スキル/志向) |
 | チャットセッション | chat_sessions | 壁打きの1スレッド(テーマ・タイトル) |
 | チャットメッセージ | chat_messages | スレッド内の1発言(user or assistant) |
@@ -184,13 +194,24 @@ erDiagram
 | ユーザーID | id | UUID | ○ | PK。Supabase Auth の auth.users.id と一致 |
 | メールアドレス | email | 文字列 | ○ | UK。認証用 |
 | 認証プロバイダ | provider | 文字列 | ○ | `email` / `google` / `github` |
-| ロール | role | 文字列 | ○ | `free`(MVP 全員)。フェーズ2で `premium` 追加 |
 | 削除日時 | deleted_at | 日時 | - | 退会申請時にセット |
 | 完全削除予定日時 | scheduled_purge_at | 日時 | - | `deleted_at + 30日` |
 | 作成日時 | created_at | 日時 | ○ | |
 | 更新日時 | updated_at | 日時 | ○ | |
 
-### 3.2 user_profiles(ユーザープロフィール)
+### 3.2 user_roles(ユーザーロール)
+
+| 論理名 | 物理名 | 型 | 必須 | 説明 |
+|---|---|---|:--:|---|
+| ロールID | id | UUID | ○ | PK |
+| ユーザーID | user_id | UUID | ○ | FK(users.id)、UK(1:1) |
+| ロール | role | 文字列 | ○ | `free`(MVP 全員) / `admin`(将来) / `premium`(フェーズ2) |
+| 作成日時 | created_at | 日時 | ○ | |
+| 更新日時 | updated_at | 日時 | ○ | |
+
+**設計理由**: JWT(`raw_user_meta_data`)でのロール判定は改ざんリスクがあるため、必ず DB の `user_roles` テーブルを参照する。更新は `service_role key` を使うサーバサイドのみ。
+
+### 3.3 user_profiles(ユーザープロフィール)
 
 | 論理名 | 物理名 | 型 | 必須 | 説明 |
 |---|---|---|:--:|---|
@@ -208,7 +229,7 @@ erDiagram
 | 作成日時 | created_at | 日時 | ○ | |
 | 更新日時 | updated_at | 日時 | ○ | |
 
-### 3.3 chat_sessions(チャットセッション)
+### 3.4 chat_sessions(チャットセッション)
 
 | 論理名 | 物理名 | 型 | 必須 | 説明 |
 |---|---|---|:--:|---|
@@ -220,7 +241,7 @@ erDiagram
 | 作成日時 | created_at | 日時 | ○ | |
 | 更新日時 | updated_at | 日時 | ○ | |
 
-### 3.4 chat_messages(チャットメッセージ)
+### 3.5 chat_messages(チャットメッセージ)
 
 | 論理名 | 物理名 | 型 | 必須 | 説明 |
 |---|---|---|:--:|---|
@@ -233,7 +254,7 @@ erDiagram
 | 消費トークン数 | tokens_used | 整数 | - | assistant メッセージのみ |
 | 作成日時 | created_at | 日時 | ○ | |
 
-### 3.5 career_plans(キャリアプラン)
+### 3.6 career_plans(キャリアプラン)
 
 | 論理名 | 物理名 | 型 | 必須 | 説明 |
 |---|---|---|:--:|---|
@@ -247,7 +268,7 @@ erDiagram
 | 作成日時 | created_at | 日時 | ○ | |
 | 更新日時 | updated_at | 日時 | ○ | |
 
-### 3.6 skill_inventories(スキル棚卸し)
+### 3.7 skill_inventories(スキル棚卸し)
 
 | 論理名 | 物理名 | 型 | 必須 | 説明 |
 |---|---|---|:--:|---|
@@ -263,7 +284,7 @@ erDiagram
 | 作成日時 | created_at | 日時 | ○ | |
 | 更新日時 | updated_at | 日時 | ○ | |
 
-### 3.7 usage_quotas(利用量クォータ)
+### 3.8 usage_quotas(利用量クォータ)
 
 | 論理名 | 物理名 | 型 | 必須 | 説明 |
 |---|---|---|:--:|---|
@@ -273,7 +294,7 @@ erDiagram
 | メッセージ数 | message_count | 整数 | ○ | 当日の送信数。上限 30 |
 | 更新日時 | updated_at | 日時 | ○ | |
 
-### 3.8 anon_sessions(匿名セッション)
+### 3.9 anon_sessions(匿名セッション)
 
 | 論理名 | 物理名 | 型 | 必須 | 説明 |
 |---|---|---|:--:|---|
@@ -291,6 +312,7 @@ erDiagram
 
 | 親エンティティ | 子エンティティ | カーディナリティ | 削除時の挙動 |
 |---|---|---|---|
+| users | user_roles | 1:1 | カスケード削除 |
 | users | user_profiles | 1:1 | カスケード削除 |
 | users | chat_sessions | 1:N | カスケード削除 |
 | chat_sessions | chat_messages | 1:N | カスケード削除 |

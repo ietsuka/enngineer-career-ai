@@ -3,8 +3,9 @@
 | 項目 | 内容 |
 |---|---|
 | プロジェクト名 | engineer-career-ai |
-| バージョン | 1.0 |
+| バージョン | 1.1 |
 | 作成日 | 2026-04-28 |
+| 更新日 | 2026-05-02 |
 
 ---
 
@@ -94,44 +95,277 @@ sequenceDiagram
 
 ---
 
-## 3. 認可(Authorization)
+## 3. 多層防御アーキテクチャ(4層 + Edge Functions)
 
-### 3.1 認可方式
+### 3.0 全体マップ
 
-- **基本方式**: ログイン/ゲストの2状態 + 「リソース所有者チェック」
-- **管理者ロール**: MVPでは設けない(運用は Supabase Studio で直接実施)
-- **将来**: ロール(無料/有料/管理者)を `users.role` 列で表現
+```
+ブラウザ
+  ↓
+【第1層】Vercel / Next.js（アプリ層）
+  ├─ middleware: 未認証リダイレクト
+  ├─ Server Action/Route Handler: user_roles テーブルで権限チェック
+  └─ getUser() で認証状態を確認(getSession() は使わない)
+  ↓
+【第2層】Supabase API キー管理
+  ├─ フロントエンド: anon key(RLS 適用)
+  └─ サーバサイドのみ: service_role key(RLS バイパス、管理・バッチのみ)
+  ↓
+【第3層】RLS（行レベルセキュリティ）
+  ├─ 全テーブルで ENABLE ROW LEVEL SECURITY 必須
+  ├─ デフォルト全拒否ポリシー(deny_all)
+  └─ 操作ごとに明示許可(SELECT/INSERT/UPDATE/DELETE)
+  ↓
+【第4層】PostgreSQL + PgBouncer（接続管理）
+  └─ ポート 6543(PgBouncer 経由)で接続枯渇を防ぐ
 
-### 3.2 RLS(Row Level Security)— **必須採用**
+【Edge Functions】(Supabase / Deno)
+  └─ Vercel 60秒制限を超える重い処理を外部委譲
+     例: スキル棚卸し AI 分析、キャリアプラン一括生成
+```
 
-Supabase の RLS を全テーブルで有効化し、**「自分のレコードしか読み書きできない」**を DB 層で強制する。
-これにより、Service 層に実装ミスがあっても他人のデータが漏洩しない**多層防御**を実現する。
+---
 
-| テーブル | RLS ポリシー(概要) |
+### 3.1 第1層: アプリ層(Vercel / Next.js)
+
+#### 3.1.1 認証状態の取得
+
+```typescript
+// ✅ 正しい: getUser()を使う(サーバーに毎回問い合わせ)
+const { data: { user } } = await supabase.auth.getUser()
+
+// ❌ 禁止: getSession()はJWTのローカル検証のみ(改ざんリスク)
+// const { data: { session } } = await supabase.auth.getSession()
+```
+
+#### 3.1.2 権限チェック(user_roles テーブル)
+
+```typescript
+export async function DELETE(req: Request) {
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return Response.json({ error: '未認証' }, { status: 401 })
+
+  // ✅ user_roles テーブルで権限確認(JWT の raw_user_meta_data は使わない)
+  const { data: roleRow } = await supabase
+    .from('user_roles')
+    .select('role')
+    .eq('user_id', user.id)
+    .single()
+
+  if (roleRow?.role !== 'admin') {
+    return Response.json({ error: '権限なし' }, { status: 403 })
+  }
+  // 処理続行...
+}
+```
+
+**禁止事項**:
+- `raw_user_meta_data`(JWT内)で権限判定しない → 改ざん可能
+- `userId` をクライアント送信パラメータから受け取らない → 必ずサーバでセッションから取得
+
+#### 3.1.3 middleware によるルート保護
+
+```typescript
+// middleware.ts
+export async function middleware(request: NextRequest) {
+  const { user } = await supabase.auth.getUser()
+  if (!user && request.nextUrl.pathname.startsWith('/(authed)')) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+}
+```
+
+---
+
+### 3.2 第2層: Supabase API キー管理
+
+```typescript
+// ✅ フロントエンド → anon key(RLS 適用、NEXT_PUBLIC_ 可)
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
+
+// ✅ サーバサイドのみ → service_role key(RLS バイパス、管理・バッチのみ)
+// infrastructure/supabase/admin-client.ts に閉じ込める
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!  // ❌ NEXT_PUBLIC_ に置かない
+)
+```
+
+**禁止事項**:
+- `NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY` は絶対に作らない → クライアントに漏洩
+- `supabaseAdmin` は `infrastructure/supabase/admin-client.ts` 内のみ。Service 層からも直接 import 禁止
+
+---
+
+### 3.3 第3層: RLS(行レベルセキュリティ)— 最後の砦
+
+#### 3.3.1 基本方針
+
+```sql
+-- ① 全テーブルで必ず有効化
+ALTER TABLE chat_sessions ENABLE ROW LEVEL SECURITY;
+
+-- ② デフォルト全拒否(まずこれを置く)
+CREATE POLICY "deny_all" ON chat_sessions USING (false);
+
+-- ③ 操作ごとに明示許可(4操作を個別設定)
+CREATE POLICY "select_own" ON chat_sessions
+  FOR SELECT USING (auth.uid() = user_id);
+
+CREATE POLICY "insert_own" ON chat_sessions
+  FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "update_own" ON chat_sessions
+  FOR UPDATE USING (auth.uid() = user_id);
+
+CREATE POLICY "delete_own" ON chat_sessions
+  FOR DELETE USING (auth.uid() = user_id);
+```
+
+#### 3.3.2 View への対応
+
+```sql
+-- RLS はデフォルトで View に効かない → security_invoker 必須
+CREATE VIEW safe_user_profiles
+  WITH (security_invoker = true)
+AS
+  SELECT id, user_id, handle_name, career_orientation FROM user_profiles;
+```
+
+#### 3.3.3 RLS 自動有効化トリガー
+
+新規テーブル作成時に RLS と `deny_all` ポリシーを自動適用:
+
+```sql
+CREATE OR REPLACE FUNCTION auto_enable_rls()
+RETURNS event_trigger AS $$
+DECLARE obj record;
+BEGIN
+  FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+  WHERE command_tag = 'CREATE TABLE'
+  LOOP
+    EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', obj.object_identity);
+    EXECUTE format('CREATE POLICY "deny_all" ON %s USING (false)', obj.object_identity);
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE EVENT TRIGGER auto_rls_trigger
+  ON ddl_command_end
+  WHEN TAG IN ('CREATE TABLE')
+  EXECUTE FUNCTION auto_enable_rls();
+```
+
+#### 3.3.4 テーブル別 RLS ポリシー一覧
+
+| テーブル | SELECT | INSERT | UPDATE | DELETE | 備考 |
+|---|:--:|:--:|:--:|:--:|---|
+| users | 自分のみ | Auth トリガー自動 | 自分のみ | ✕(退会は論理削除) | |
+| user_roles | 自分のみ | ✕(サーバのみ) | ✕(サーバのみ) | ✕(サーバのみ) | service_role で管理 |
+| user_profiles | 自分のみ | 自分のみ | 自分のみ | ✕(退会時 cascade) | |
+| chat_sessions | 自分のみ | 自分のみ | 自分のみ | 自分のみ | |
+| chat_messages | 親 session 所有者 | 親 session 所有者 | ✕ | 親 session 所有者 | |
+| career_plans | 自分のみ | 自分のみ | 自分のみ | 自分のみ | |
+| skill_inventories | 自分のみ | 自分のみ | 自分のみ | 自分のみ | |
+| usage_quotas | 自分のみ | ✕(サーバのみ) | ✕(サーバのみ) | ✕ | service_role で upsert |
+| api_usage_logs | 自分のみ | ✕(サーバのみ) | ✕ | ✕ | |
+| consent_logs | 自分のみ | anon 可 | ✕ | ✕ | |
+| audit_logs | 自分のみ | ✕(サーバのみ) | ✕ | ✕ | |
+| anon_sessions | ✕ | ✕(サーバのみ) | ✕(サーバのみ) | ✕ | service_role のみ |
+| anon_messages | ✕ | ✕(サーバのみ) | ✕ | ✕(サーバのみ) | service_role のみ |
+
+---
+
+### 3.4 第4層: PgBouncer(接続管理)
+
+```typescript
+// ✅ ポート 6543(PgBouncer 経由)を使用
+// Supabase の接続文字列でポートを 5432 → 6543 に変更するだけ
+const connectionString =
+  'postgresql://user:pass@db.xxx.supabase.co:6543/postgres?pgbouncer=true'
+```
+
+**目的**: サーバレス環境(Vercel)は関数ごとに DB コネクションを張るため、PgBouncer なしでは接続が枯渇する。
+
+---
+
+### 3.5 Edge Functions(Supabase / Deno)
+
+**目的**: Vercel の 60 秒制限を超える重い処理を Supabase Edge Functions に委譲する。
+
+#### 3.5.1 対象処理
+
+| 処理 | 理由 |
 |---|---|
-| users | 自分の行のみ SELECT/UPDATE 可。INSERT は Auth トリガーで自動 |
-| user_profiles | `user_id = auth.uid()` のみ全操作可 |
-| chat_sessions | 同上 |
-| chat_messages | 関連 chat_sessions の所有者のみ操作可 |
-| career_plans | `user_id = auth.uid()` のみ全操作可 |
-| skill_inventories | `user_id = auth.uid()` のみ全操作可 |
-| usage_quotas | `user_id = auth.uid()` のみ SELECT 可、UPDATE はサーバ側のみ |
-| consent_logs | INSERT のみ可、SELECT は本人のみ |
+| スキル棚卸し AI 分析(API-024) | プロフィール全体を踏まえた長文生成で 60 秒超えの可能性 |
+| キャリアプラン一括生成 | 複数ステップの AI 推論で処理時間が長い |
+| 退会時の完全削除バッチ | `scheduled_purge_at` 到達ユーザーの全データ削除 |
+| 匿名セッションのクリーンアップ | `expires_at` 超過の `anon_sessions` 定期削除 |
 
-### 3.3 Service 層での認可チェック
+#### 3.5.2 フロー(Fire-and-Forget)
 
-RLS は最終防衛線。Service 層でも以下を必須実装:
+```
+ブラウザ
+  ↓ ① リクエスト
+Next.js(Route Handler)
+  ↓ ② Edge Function に投げる(await しない)
+  ↓ ③ job_id を即返す(HTTP 202)
+Supabase Edge Function(Deno)
+  ↓ 重い処理をバックグラウンドで実行
+  ↓ 結果を DB に保存
+DB
+  ↑ ④ ポーリング or WebSocket で結果を受け取る
+ブラウザ
+```
 
-1. 全 Server Action / Route Handler の入口で `getUser()` を呼び、未ログイン時は 401
-2. リソース操作系 API は「リクエストの userId == 操作対象リソースの user_id」を検証
-3. 縦方向権限昇格防止: `userId` をクライアント送信パラメータから受け取らない(必ずサーバ側でセッションから取得)
+```typescript
+// ✅ Vercel 側: await しない(投げっぱなし)
+fetch(process.env.SUPABASE_EDGE_FUNCTION_URL + '/skill-analysis', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${process.env.SUPABASE_SERVICE_ROLE_KEY}` },
+  body: JSON.stringify({ job_id, inventory_id })
+})  // ← await しない
 
-### 3.4 ゲスト(未ログイン)の状態管理
+return Response.json({ job_id }, { status: 202 })
+
+// ✅ Edge Function 側: waitUntil でバックグラウンド処理
+Deno.serve(async (req) => {
+  const { job_id, inventory_id } = await req.json()
+
+  EdgeRuntime.waitUntil((async () => {
+    // AI 分析(時間がかかる)
+    const analysis = await generateAnalysis(inventory_id)
+    await supabase.from('skill_inventories')
+      .update({ ai_analysis: analysis, analyzed_at: new Date() })
+      .eq('id', inventory_id)
+    await supabase.from('jobs')
+      .update({ status: 'done' })
+      .eq('id', job_id)
+  })())
+
+  return new Response('ok')  // すぐ返す
+})
+```
+
+#### 3.5.3 結果受け取り方式
+
+| 方式 | 採用 | 理由 |
+|---|:--:|---|
+| ポーリング(DB polling) | ✅ MVP | シンプル実装。スキル分析は即時性より安定性 |
+| WebSocket(Supabase Realtime) | フェーズ2 | 即時通知が必要になった時に追加 |
+| SSE | ✕ | Vercel では使えない。Edge Function 側なら可だが複雑 |
+
+---
+
+### 3.6 ゲスト(未ログイン)の状態管理
 
 - 未ログイン壁打ちは **匿名セッションID(httpOnly Cookie に保存)** でメッセージ数を管理
 - セッションIDはサーバで発行し、クライアントから書き換え不可
-- メッセージ数カウントは **サーバ側ストア**(Vercel KV または Supabase の専用テーブル `anon_sessions`)で管理し、Cookie の改ざんで突破不可
-- MVP実装方針: **Supabase の `anon_sessions` テーブル**(Vercel KV を増やさず単一DBで完結)
+- カウント管理: `anon_sessions.message_count` を service_role で upsert(Cookie 改ざんで突破不可)
+- メッセージ内容: `anon_messages` テーブルに保存(将来ログイン後引き継ぎ機能に備える)
 
 ---
 

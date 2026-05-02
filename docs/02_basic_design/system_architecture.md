@@ -3,8 +3,9 @@
 | 項目 | 内容 |
 |---|---|
 | プロジェクト名 | engineer-career-ai |
-| バージョン | 1.0 |
+| バージョン | 1.1 |
 | 作成日 | 2026-04-26 |
+| 更新日 | 2026-05-02 |
 
 ---
 
@@ -25,7 +26,8 @@ graph TB
 
     subgraph Supabase["Supabase"]
         Auth["Supabase Auth<br/>(Email / Google / GitHub)"]
-        DB[("PostgreSQL<br/>+ RLS")]
+        DB[("PostgreSQL(6543)<br/>+ RLS + PgBouncer")]
+        EdgeFn["Edge Functions<br/>(Deno)"]
         Storage["Storage<br/>(将来用)"]
     end
 
@@ -33,13 +35,17 @@ graph TB
         Anthropic["Anthropic API<br/>(Claude Haiku 4.5)"]
         Recaptcha["Google reCAPTCHA"]
         JobSites["求人サイト<br/>(リンク誘導のみ)"]
+        Figma["Figma<br/>(デザイン参照)"]
     end
 
     Browser -->|HTTPS| NextApp
     NextApp --> ServerActions
     ServerActions --> Auth
-    ServerActions --> DB
+    ServerActions -->|port 6543| DB
     ServerActions --> Anthropic
+    ServerActions -->|fire-and-forget| EdgeFn
+    EdgeFn --> DB
+    EdgeFn --> Anthropic
     Browser -->|reCAPTCHA token| ServerActions
     ServerActions -->|verify| Recaptcha
     Browser -->|外部遷移| JobSites
@@ -49,10 +55,12 @@ graph TB
 
 | コンポーネント | 役割 | 技術スタック |
 |---|---|---|
-| フロントエンド | UI 描画、ユーザー操作受付、レスポンシブ対応 | Next.js 15 (TypeScript, App Router) + Tailwind CSS |
+| フロントエンド | UI 描画、ユーザー操作受付、レスポンシブ対応 | Next.js 15 (TypeScript, App Router) + **Melta UI** + Tailwind CSS 4 |
+| デザインシステム | コンポーネント定義・Figma 連携 | **Melta UI**(AI最適化・28コンポーネント・99デザイントークン) + **Figma** |
 | バックエンド | API 受付、ビジネスロジック、AI 呼び出し | Next.js Server Actions / Route Handlers (TypeScript) |
+| 重い非同期処理 | 60秒超え処理の委譲(AI分析・バッチ) | **Supabase Edge Functions (Deno)** |
 | 認証 | ログイン、ソーシャル認証、セッション管理 | Supabase Auth |
-| データベース | ユーザー、会話、キャリアプラン等の永続化 | Supabase (PostgreSQL 15) |
+| データベース | ユーザー、会話、キャリアプラン等の永続化 | Supabase (PostgreSQL 15) + **PgBouncer(port 6543)** |
 | AI | キャリア相談の回答生成 | Anthropic API (Claude Haiku 4.5) |
 | ホスティング | デプロイ、CDN、Edge配信 | Vercel |
 | Bot対策 | 不正連投検知 | Google reCAPTCHA v3 |
@@ -276,8 +284,10 @@ graph LR
 |---|---|---|
 | 言語 | TypeScript 5.x | 型安全、エコシステム豊富、レイヤード設計の interface 表現に適する |
 | フレームワーク | Next.js 15(App Router) | フルスタックで Vercel 最適、Server Actions / Streaming SSE が AI チャット UX に最適 |
-| UI スタイル | Tailwind CSS | レスポンシブ対応が容易、スマホファースト構築が早い |
-| DB | PostgreSQL 15(Supabase) | RLS が認可実装に有効、Supabase Auth との統合が密、無料枠で MAU 5 人想定をカバー |
+| デザインシステム | **Melta UI** + Tailwind CSS 4 | AI 最適化設計システム(28 コンポーネント・99 トークン・89 禁止ルール)。DESIGN.md + CLAUDE.md で AI が一貫した UI を実装できる |
+| デザイン | **Figma** + Figma MCP | 画面デザインを Figma で作成し MCP 経由でコードに変換。Melta UI の Figma ライブラリと連動 |
+| DB | PostgreSQL 15(Supabase) + **PgBouncer** | RLS・多層防御。PgBouncer(port 6543)でサーバレス環境の接続枯渇を防止 |
+| 非同期重処理 | **Supabase Edge Functions(Deno)** | Vercel 60 秒制限を超える AI 分析・バッチ削除を Fire-and-Forget で委譲 |
 | 認証 | Supabase Auth | Email / Google / GitHub をプラグインで提供、自前実装より安全・速い |
 | AI | Anthropic API(Claude Haiku 4.5) | コスト効率、日本語品質、当開発環境(Claude Code)との親和性 |
 | ホスティング | Vercel | Next.js 公式ホスティング、Edge Network、Hobby プランで MAU 5 人想定をカバー |
@@ -294,6 +304,32 @@ graph LR
 | Cloudflare Workers / Pages | Next.js App Router の Server Actions が Vercel 最適化されているため見送り |
 | Firestore | RLS 相当の柔軟性に劣り、リレーショナルクエリも難しい(履歴・キャリアプラン管理に不利) |
 | クリーンアーキテクチャ厳密実装 | MAU 5 人想定にはオーバーエンジニアリング。レイヤード採用 |
+| shadcn/ui | Melta UI がAI開発環境に最適化されているため。Melta UI は DESIGN.md / CLAUDE.md ベースで AI が一貫したUI実装可能 |
+| Tailwind CSS 3 | Melta UI が Tailwind CSS 4 を採用しているため合わせる |
+| Vercel KV(Redis) | 匿名セッション管理は Supabase の `anon_sessions` テーブルに統一。外部ストアを増やさない |
+
+### 5.2 Melta UI + Figma のワークフロー
+
+```
+Figma(デザイン)
+  ↓ Figma MCP
+デザイン参照 → Melta UI コンポーネントにマッピング
+  ↓
+Next.js コンポーネント実装
+  (DESIGN.md + CLAUDE.md ガイドラインに沿って)
+  ↓
+89 禁止ルールによる自動チェック(CI)
+```
+
+**Melta UI の主要コンポーネント(engineer-career-ai で使用予定)**:
+
+| カテゴリ | コンポーネント |
+|---|---|
+| フォーム | Button, TextField, Checkbox, Toggle, DatePicker |
+| チャット UI | Card(メッセージバブル相当), Alert(免責・通知) |
+| ナビゲーション | Sidebar, Tabs, Breadcrumb |
+| フィードバック | Modal(ログイン誘導), Toast, Skeleton(ローディング), Tooltip |
+| データ表示 | List(履歴・プラン一覧), Badge, Avatar |
 
 ---
 
